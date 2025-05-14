@@ -1,0 +1,939 @@
+unit Unit1;
+
+interface
+
+uses
+  Windows, Messages, SysUtils, Variants, Classes, Graphics, Controls, Forms,
+  Dialogs, DB, ADODB, Grids, DBGrids, StdCtrls, CheckLst, ComCtrls, Math, IniFiles,
+  Menus, ImgList;
+
+type
+  TProtectionItem = record
+
+    ID: Integer;
+    Name: string;
+    Cost: Currency;
+    Level: Integer;
+    Category: string;
+    TProtectionCompare: function(List: TStringList; Index1, Index2: Integer): Integer of object;
+  end;
+
+  TForm1 = class(TForm)
+    ADOConnection1: TADOConnection;
+    DataSource1: TDataSource;
+    DBGrid1: TDBGrid;
+    ADOQuery1: TADOQuery;
+    CheckListBox1: TCheckListBox;
+    Button1: TButton;
+    Memo1: TMemo;
+    Label1: TLabel;
+    Label2: TLabel;
+    TrackBar1: TTrackBar;
+    Label3: TLabel;
+    Label4: TLabel;
+    btnRecommend: TButton;
+    btnOptimizeCost: TButton;
+    btnOptimizeEffect: TButton;
+    btnSaveConfig: TButton;
+    btnLoadConfig: TButton;
+    ProgressBar1: TProgressBar;
+    LabelTotalScore: TLabel;
+    btnGenerateReport: TButton;
+    ComboBox1: TComboBox;
+    MainMenu1: TMainMenu;
+    HelpMenu: TMenuItem;
+    HelpAbout: TMenuItem;
+    HelpContents: TMenuItem;
+    FileExit: TMenuItem;
+    btnRandomThreats: TButton;
+    btnClearThreats: TButton;
+    procedure FormCreate(Sender: TObject);
+    procedure Button1Click(Sender: TObject);
+    procedure TrackBar1Change(Sender: TObject);
+    procedure btnRecommendClick(Sender: TObject);
+    procedure btnOptimizeCostClick(Sender: TObject);
+    procedure btnOptimizeEffectClick(Sender: TObject);
+    procedure btnSaveConfigClick(Sender: TObject);
+    procedure btnLoadConfigClick(Sender: TObject);
+    procedure btnGenerateReportClick(Sender: TObject);
+    procedure DBGrid1DrawColumnCell(Sender: TObject; const Rect: TRect;
+      DataCol: Integer; Column: TColumn; State: TGridDrawState);
+    procedure FileExitClick(Sender: TObject);
+    procedure HelpAboutClick(Sender: TObject);
+    procedure HelpContentsClick(Sender: TObject);
+    procedure ComboBox1Change(Sender: TObject);
+    procedure btnRandomThreatsClick(Sender: TObject);
+    procedure btnClearThreatsClick(Sender: TObject);
+  private
+    FAllProtections: array of TProtectionItem;
+    FSelectedProtections: TList;
+    procedure LoadThreats;
+    procedure LoadProtectionMeasures;
+    function GetProtectionByID(ID: Integer): TProtectionItem;
+    function CalculateCompatibilityScore: Integer;
+    function CalculateTotalCost: Currency;
+    function CalculateTotalEffectiveness: Integer;
+    function IsThreatCovered(ThreatIndex: Integer): Boolean;
+    procedure UpdateVisualIndicators;
+    function CalculateTotalScore: Integer;
+    function CompareProtections(List: TStringList; Index1, Index2: Integer): Integer;
+    function TextLevelToNumber(LevelText: string): Integer;
+    function NumberLevelToText(Level: Integer): string;
+    function SafeSQLStr(const Value: string): string;
+    procedure ApplyFilters;
+  public
+    destructor Destroy; override;
+  end;
+
+var
+  Form1: TForm1;
+
+implementation
+
+{$R *.dfm}
+
+function TForm1.TextLevelToNumber(LevelText: string): Integer;
+begin
+  if Pos('Низкий', LevelText) > 0 then Result := 1
+  else if Pos('Средний', LevelText) > 0 then Result := 2
+  else if Pos('Высокий', LevelText) > 0 then Result := 3
+  else Result := 2; // По умолчанию - средний
+end;
+
+// Новая функция преобразования числа в текст
+function TForm1.NumberLevelToText(Level: Integer): string;
+begin
+  case Level of
+    1: Result := 'Низкий';
+    2: Result := 'Средний';
+    3: Result := 'Высокий';
+  else
+    Result := 'Не определен';
+  end;
+end;
+
+function TForm1.CompareProtections(List: TStringList; Index1, Index2: Integer): Integer;
+begin
+  Result := Integer(List.Objects[Index2]) - Integer(List.Objects[Index1]);
+end;
+
+function TForm1.SafeSQLStr(const Value: string): string;
+begin
+  Result := StringReplace(Value, '''', '''''', [rfReplaceAll]);
+end;
+
+function CompareProtections(List: TStringList; Index1, Index2: Integer): Integer;
+var  Score1, Score2: Integer;
+begin
+  Score1 := Integer(List.Objects[Index1]);
+  Score2 := Integer(List.Objects[Index2]);
+  if Score1 <> Score2 then
+    Result := Score2 - Score1
+  else
+  Result := Integer(List.Objects[Index2]) - Integer(List.Objects[Index1]);
+end;
+
+
+procedure TForm1.FormCreate(Sender: TObject);
+begin
+  FSelectedProtections := TList.Create;
+  
+  // Настройка подключения к Access
+  ADOConnection1.ConnectionString :=
+    'Provider=Microsoft.Jet.OLEDB.4.0;' +
+    'Data Source=' + ExtractFilePath(Application.ExeName) + 'SecurityDB.mdb;' +
+    'Persist Security Info=False';
+
+  // Подсказки для кнопок
+  Button1.Hint := 'Анализирует выбранные угрозы и средства защиты|Показывает стоимость и совместимость комплекса';
+  btnRecommend.Hint := 'Рекомендует дополнительные средства защиты|Основано на выбранных угрозах и текущем наборе';
+  btnOptimizeCost.Hint := 'Уменьшает стоимость комплекса|Удаляет самые дорогие средства без критического снижения защиты';
+  btnOptimizeEffect.Hint := 'Улучшает эффективность комплекса|Заменяет слабые средства на более мощные аналоги';
+  btnSaveConfig.Hint := 'Сохраняет текущую конфигурацию|Запоминает выбранные угрозы и средства защиты';
+  btnLoadConfig.Hint := 'Загружает сохранённую конфигурацию|Восстанавливает предыдущий выбор угроз и средств';
+  btnGenerateReport.Hint := 'Создаёт текстовый отчёт|Содержит полную информацию о комплексе защиты';
+
+  // Подсказки для элементов управления
+  CheckListBox1.Hint := 'Отметьте угрозы, от которых нужна защита|Ctrl+Click для множественного выбора';
+  DBGrid1.Hint := 'Выберите средства защиты|Выделите несколько строк (Ctrl+Click)';
+  TrackBar1.Hint := 'Установите требуемый уровень защиты|1-Минимальный, 2-Стандартный, 3-Максимальный';
+  ComboBox1.Hint := 'Фильтр по категориям средств защиты|Позволяет отобрать средства определённого типа';
+
+  // Подсказки для меню
+  FileExit.Hint := 'Завершает работу программы';
+  HelpAbout.Hint := 'Показывает информацию о программе';
+  HelpContents.Hint := 'Открывает краткое руководство';
+
+  // Включаем отображение подсказок
+  Application.ShowHint := True;
+  Application.HintPause := 500;    // Задержка перед показом (мс)
+  Application.HintHidePause := 5000; // Время отображения подсказки
+
+
+  
+
+  try
+    ADOConnection1.Connected := True;
+    LoadThreats;
+    LoadProtectionMeasures;
+
+    // Настройка интерфейса
+    TrackBar1.Min := 1;
+    TrackBar1.Max := 3;
+    TrackBar1.Position := 2;
+    TrackBar1Change(nil);
+    
+    ComboBox1.Items.Add('Все категории');
+    ComboBox1.Items.Add('Криптография');
+    ComboBox1.Items.Add('Антивирус');
+    ComboBox1.Items.Add('Сетевая защита');
+    ComboBox1.Items.Add('Защита данных');
+    ComboBox1.Items.Add('Аутентификация');
+    ComboBox1.Items.Add('Мониторинг');
+    ComboBox1.Items.Add('Фильтрация');
+    ComboBox1.ItemIndex := 0;
+
+    ProgressBar1.Min := 0;
+    ProgressBar1.Max := 100;
+    
+  except
+    on E: Exception do
+      ShowMessage('Ошибка подключения к базе данных: ' + E.Message);
+  end;
+end;
+
+
+destructor TForm1.Destroy;
+begin
+  FSelectedProtections.Free;
+  inherited;
+end;
+
+procedure TForm1.LoadThreats;
+var
+  Query: TADOQuery;
+begin
+  Query := TADOQuery.Create(nil);
+  try
+    Query.Connection := ADOConnection1;
+    Query.SQL.Text := 'SELECT Название, Уровень_опасности FROM Threats';
+    Query.Open;
+
+    CheckListBox1.Items.BeginUpdate;
+    try
+      CheckListBox1.Items.Clear;
+      while not Query.Eof do
+      begin
+        CheckListBox1.Items.AddObject(
+          Query.FieldByName('Название').AsString + 
+          ' (Уровень: ' + Query.FieldByName('Уровень_опасности').AsString + ')',
+          TObject(StrToIntDef(Query.FieldByName('Уровень_опасности').AsString, 0))
+        );
+        Query.Next;
+      end;
+    finally
+      CheckListBox1.Items.EndUpdate;
+    end;
+  finally
+    Query.Free;
+  end;
+end;
+
+procedure TForm1.LoadProtectionMeasures;
+var
+  i: Integer;
+begin
+  ADOQuery1.Close;
+  ADOQuery1.SQL.Text := 'SELECT * FROM ProtectionMeasures';
+  ADOQuery1.Open;
+
+  SetLength(FAllProtections, ADOQuery1.RecordCount);
+  i := 0;
+  while not ADOQuery1.Eof do
+  begin
+    FAllProtections[i].ID := ADOQuery1.FieldByName('ID').AsInteger;
+    FAllProtections[i].Name := ADOQuery1.FieldByName('Название').AsString;
+    FAllProtections[i].Cost := ADOQuery1.FieldByName('Стоимость').AsCurrency;
+
+    // Изменено для работы с текстовыми или числовыми значениями
+    if ADOQuery1.FieldByName('Уровень_защиты').DataType = ftString then
+      FAllProtections[i].Level := TextLevelToNumber(ADOQuery1.FieldByName('Уровень_защиты').AsString)
+    else
+      FAllProtections[i].Level := ADOQuery1.FieldByName('Уровень_защиты').AsInteger;
+    
+    FAllProtections[i].Category := ADOQuery1.FieldByName('Категория').AsString;
+    Inc(i);
+    ADOQuery1.Next;
+  end;
+  
+  DataSource1.DataSet := ADOQuery1;
+end;
+
+
+procedure TForm1.Button1Click(Sender: TObject);
+var
+  i: Integer;
+begin
+  FSelectedProtections.Clear;
+
+  // Сохраняем выбранные пользователем средства
+  for i := 0 to DBGrid1.SelectedRows.Count - 1 do
+  begin
+    DBGrid1.DataSource.DataSet.Bookmark := DBGrid1.SelectedRows[i];
+    FSelectedProtections.Add(Pointer(DBGrid1.DataSource.DataSet.FieldByName('ID').AsInteger));
+  end;
+
+  // Показываем информацию о выборе
+  Memo1.Lines.Add('=== ВАШ ВЫБОР ===');
+  Memo1.Lines.Add('Дата: ' + FormatDateTime('dd.mm.yyyy hh:nn', Now));
+  Memo1.Lines.Add('Выбрано средств: ' + IntToStr(FSelectedProtections.Count));
+
+  for i := 0 to FSelectedProtections.Count - 1 do
+    Memo1.Lines.Add(' - ' + GetProtectionByID(Integer(FSelectedProtections[i])).Name);
+
+  Memo1.Lines.Add('Общая стоимость: ' + CurrToStr(CalculateTotalCost) + ' руб.');
+  Memo1.Lines.Add('Оценка совместимости: ' + IntToStr(CalculateCompatibilityScore) + '/100');
+
+  UpdateVisualIndicators;
+end;
+
+procedure TForm1.btnRecommendClick(Sender: TObject);
+var
+  Query: TADOQuery;
+  i, j, Score: Integer;
+  RecList: TStringList;
+  ThreatName: string;
+  SelectedThreats: TStringList;
+begin
+  if FSelectedProtections.Count = 0 then
+  begin
+    ShowMessage('Сначала выберите средства защиты!');
+    Exit;
+  end;
+
+  // Собираем выбранные угрозы
+  SelectedThreats := TStringList.Create;
+  try
+    for i := 0 to CheckListBox1.Items.Count - 1 do
+    begin
+      if CheckListBox1.Checked[i] then
+      begin
+        ThreatName := Copy(CheckListBox1.Items[i], 1, Pos(' (', CheckListBox1.Items[i]) - 1);
+        SelectedThreats.Add(ThreatName);
+      end;
+    end;
+
+    if SelectedThreats.Count = 0 then
+    begin
+      ShowMessage('Выберите угрозы для анализа!');
+      Exit;
+    end;
+
+    RecList := TStringList.Create;
+    Query := TADOQuery.Create(nil);
+    try
+      Query.Connection := ADOConnection1;
+
+      // Анализ всех доступных средств защиты
+      for i := 0 to High(FAllProtections) do
+      begin
+        // Пропускаем уже выбранные средства
+        if FSelectedProtections.IndexOf(Pointer(FAllProtections[i].ID)) >= 0 then
+          Continue;
+
+        Score := 0;
+
+        // Проверяем эффективность против выбранных угроз
+        for j := 0 to SelectedThreats.Count - 1 do
+        begin
+          Query.SQL.Text := 
+            'SELECT Эффективность FROM Relations WHERE ' +
+            'ThreatID = (SELECT ID FROM Threats WHERE Название = ''' + 
+            StringReplace(SelectedThreats[j], '''', '''''', [rfReplaceAll]) + ''') AND ' +
+            'ProtectionID = ' + IntToStr(FAllProtections[i].ID);
+          
+          Query.Open;
+          
+          if not Query.Eof then
+            Inc(Score, Query.FieldByName('Эффективность').AsInteger);
+            
+          Query.Close;
+        end;
+
+        // Если средство эффективно хотя бы против одной угрозы
+        if Score > 0 then
+        begin
+          RecList.AddObject(
+            Format('%s | Эффективность: %d | Цена: %s руб. | Уровень: %s', [
+              FAllProtections[i].Name,
+              Score,
+              CurrToStr(FAllProtections[i].Cost),
+              NumberLevelToText(FAllProtections[i].Level)
+            ]),
+            Pointer(Score)
+          );
+        end;
+      end;
+
+      // Сортировка с использованием метода класса
+      if RecList.Count > 0 then
+      begin
+        // Правильный способ сортировки в Delphi 7
+        for i := 0 to RecList.Count - 2 do
+          for j := i + 1 to RecList.Count - 1 do
+            if CompareProtections(RecList, i, j) > 0 then
+              RecList.Exchange(i, j);
+      end;
+
+      // Вывод результатов
+      Memo1.Lines.Add('');
+      Memo1.Lines.Add('=== РЕКОМЕНДАЦИИ ===');
+      Memo1.Lines.Add('На основе выбранных угроз:');
+      for i := 0 to SelectedThreats.Count - 1 do
+        Memo1.Lines.Add(' - ' + SelectedThreats[i]);
+      
+      Memo1.Lines.Add('');
+      Memo1.Lines.Add('Топ рекомендаций:');
+      for i := 0 to Min(4, RecList.Count - 1) do
+        Memo1.Lines.Add(Format('%d. %s', [i+1, RecList[i]]));
+
+    finally
+      Query.Free;
+      RecList.Free;
+    end;
+  finally
+    SelectedThreats.Free;
+  end;
+end;
+
+
+procedure TForm1.btnOptimizeCostClick(Sender: TObject);
+var
+  i, MaxCostIndex: Integer;
+  MaxCost: Currency;
+begin
+  if FSelectedProtections.Count = 0 then Exit;
+
+  // Упрощенная оптимизация - удаляем самые дорогие элементы
+  while (FSelectedProtections.Count > 1) and (CalculateTotalCost > 100000) do
+  begin
+    // Находим самое дорогое средство
+    MaxCost := 0;
+    MaxCostIndex := -1;
+
+    for i := 0 to FSelectedProtections.Count - 1 do
+    begin
+      if GetProtectionByID(Integer(FSelectedProtections[i])).Cost > MaxCost then
+      begin
+        MaxCost := GetProtectionByID(Integer(FSelectedProtections[i])).Cost;
+        MaxCostIndex := i;
+      end;
+    end;
+    
+    if MaxCostIndex >= 0 then
+    begin
+      Memo1.Lines.Add('Удалено: ' + GetProtectionByID(Integer(FSelectedProtections[MaxCostIndex])).Name);
+      FSelectedProtections.Delete(MaxCostIndex);
+    end;
+  end;
+
+  // Обновляем информацию
+  Memo1.Lines.Add('');
+  Memo1.Lines.Add('=== РЕЗУЛЬТАТ ОПТИМИЗАЦИИ ===');
+  Memo1.Lines.Add('Новая стоимость: ' + CurrToStr(CalculateTotalCost) + ' руб.');
+  Memo1.Lines.Add('Оставшиеся средства:');
+
+  for i := 0 to FSelectedProtections.Count - 1 do
+    Memo1.Lines.Add(' - ' + GetProtectionByID(Integer(FSelectedProtections[i])).Name);
+  
+  UpdateVisualIndicators;
+end;
+
+procedure TForm1.btnOptimizeEffectClick(Sender: TObject);
+var
+  i, j, MinEffectIndex, Effect: Integer;
+  MinEffect: Integer;
+  Query: TADOQuery;
+begin
+  if FSelectedProtections.Count = 0 then Exit;
+
+  Query := TADOQuery.Create(nil);
+  try
+    Query.Connection := ADOConnection1;
+
+    // Упрощенная оптимизация - удаляем наименее эффективные против выбранных угроз
+    while FSelectedProtections.Count > 3 do
+    begin
+      // Находим средство с наименьшей эффективностью
+      MinEffect := MaxInt;
+      MinEffectIndex := -1;
+      
+      for i := 0 to FSelectedProtections.Count - 1 do
+      begin
+        Effect := 0;
+
+        // Считаем эффективность против выбранных угроз
+        for j := 0 to CheckListBox1.Items.Count - 1 do
+        begin
+          if CheckListBox1.Checked[j] then
+          begin
+            Query.SQL.Text := 
+              'SELECT Эффективность FROM Relations WHERE ' +
+              'ThreatID = (SELECT ID FROM Threats WHERE Название = :ThreatName) AND ' +
+              'ProtectionID = :ProtID';
+              
+            Query.Parameters.ParamByName('ThreatName').Value :=
+              Copy(CheckListBox1.Items[j], 1, Pos(' (', CheckListBox1.Items[j]) - 1);
+            Query.Parameters.ParamByName('ProtID').Value := Integer(FSelectedProtections[i]);
+            Query.Open;
+            
+            if not Query.Eof then
+              Inc(Effect, Query.FieldByName('Эффективность').AsInteger);
+
+            Query.Close;
+          end;
+        end;
+
+        if Effect < MinEffect then
+        begin
+          MinEffect := Effect;
+          MinEffectIndex := i;
+        end;
+      end;
+      
+      if MinEffectIndex >= 0 then
+      begin
+        Memo1.Lines.Add('Удалено: ' + GetProtectionByID(Integer(FSelectedProtections[MinEffectIndex])).Name);
+        FSelectedProtections.Delete(MinEffectIndex);
+      end;
+    end;
+    
+    // Обновляем информацию
+    Memo1.Lines.Add('');
+    Memo1.Lines.Add('=== РЕЗУЛЬТАТ ОПТИМИЗАЦИИ ===');
+    Memo1.Lines.Add('Общая эффективность: ' + IntToStr(CalculateTotalEffectiveness));
+    Memo1.Lines.Add('Оставшиеся средства:');
+    
+    for i := 0 to FSelectedProtections.Count - 1 do
+      Memo1.Lines.Add(' - ' + GetProtectionByID(Integer(FSelectedProtections[i])).Name);
+    
+    UpdateVisualIndicators;
+    
+  finally
+    Query.Free;
+  end;
+end;
+
+procedure TForm1.btnSaveConfigClick(Sender: TObject);
+var
+  IniFile: TIniFile;
+  i: Integer;
+  ConfigFile: string;
+begin
+  ConfigFile := ExtractFilePath(Application.ExeName) + 'config.ini';
+  IniFile := TIniFile.Create(ConfigFile);
+  try
+    // Сохраняем выбранные средства
+    IniFile.WriteInteger('Main', 'Count', FSelectedProtections.Count);
+    for i := 0 to FSelectedProtections.Count - 1 do
+      IniFile.WriteInteger('Items', 'ID'+IntToStr(i), Integer(FSelectedProtections[i]));
+
+    // Сохраняем настройки
+    IniFile.WriteInteger('Settings', 'ProtectionLevel', TrackBar1.Position);
+    IniFile.WriteInteger('Settings', 'CategoryIndex', ComboBox1.ItemIndex);
+    
+    ShowMessage('Конфигурация сохранена в файл: ' + ConfigFile);
+  finally
+    IniFile.Free;
+  end;
+end;
+
+procedure TForm1.btnLoadConfigClick(Sender: TObject);
+var
+  IniFile: TIniFile;
+  i, Count: Integer;
+  ConfigFile: string;
+begin
+  ConfigFile := ExtractFilePath(Application.ExeName) + 'config.ini';
+  if not FileExists(ConfigFile) then
+  begin
+    ShowMessage('Файл конфигурации не найден!');
+    Exit;
+  end;
+
+  IniFile := TIniFile.Create(ConfigFile);
+  try
+    // Загружаем выбранные средства
+    FSelectedProtections.Clear;
+    Count := IniFile.ReadInteger('Main', 'Count', 0);
+    
+    for i := 0 to Count - 1 do
+      FSelectedProtections.Add(Pointer(IniFile.ReadInteger('Items', 'ID'+IntToStr(i), 0)));
+    
+    // Загружаем настройки
+    TrackBar1.Position := IniFile.ReadInteger('Settings', 'ProtectionLevel', 3);
+    ComboBox1.ItemIndex := IniFile.ReadInteger('Settings', 'CategoryIndex', 0);
+    
+    // Обновляем информацию
+    Button1Click(nil);
+    ShowMessage('Конфигурация загружена из файла: ' + ConfigFile);
+  finally
+    IniFile.Free;
+  end;
+end;
+
+procedure TForm1.btnGenerateReportClick(Sender: TObject);
+var
+  Report: TStringList;
+  i: Integer;
+  ReportFile: string;
+begin
+  if FSelectedProtections.Count = 0 then
+  begin
+    ShowMessage('Нет данных для отчета!');
+    Exit;
+  end;
+
+  Report := TStringList.Create;
+  try
+    Report.Add('=== ОТЧЕТ О КОМПЛЕКСЕ ЗАЩИТЫ ===');
+    Report.Add('Дата формирования: ' + FormatDateTime('dd.mm.yyyy hh:nn', Now));
+    Report.Add('');
+    
+    Report.Add('=== ПАРАМЕТРЫ ПОДБОРА ===');
+    Report.Add('Уровень защиты: ' + IntToStr(TrackBar1.Position));
+    Report.Add('Категория: ' + ComboBox1.Items[ComboBox1.ItemIndex]);
+    Report.Add('');
+
+    Report.Add('=== ВЫБРАННЫЕ СРЕДСТВА ЗАЩИТЫ ===');
+    for i := 0 to FSelectedProtections.Count - 1 do
+    begin
+      Report.Add(Format('%d. %s', [i+1, GetProtectionByID(Integer(FSelectedProtections[i])).Name]));
+      Report.Add(Format('   - Уровень защиты: %d', [GetProtectionByID(Integer(FSelectedProtections[i])).Level]));
+      Report.Add(Format('   - Стоимость: %s руб.', [CurrToStr(GetProtectionByID(Integer(FSelectedProtections[i])).Cost)]));
+      Report.Add(Format('   - Категория: %s', [GetProtectionByID(Integer(FSelectedProtections[i])).Category]));
+      Report.Add('');
+    end;
+
+    Report.Add('=== СВОДНЫЕ ПОКАЗАТЕЛИ ===');
+    Report.Add('Общая стоимость: ' + CurrToStr(CalculateTotalCost) + ' руб.');
+    Report.Add('Оценка совместимости: ' + IntToStr(CalculateCompatibilityScore) + '/100');
+    Report.Add('Общая эффективность: ' + IntToStr(CalculateTotalEffectiveness));
+    Report.Add('');
+    
+    Report.Add('=== РЕКОМЕНДАЦИИ ===');
+    if CalculateCompatibilityScore < 70 then
+      Report.Add('Внимание! Низкая совместимость средств защиты. Рекомендуется пересмотреть состав комплекса.')
+    else
+      Report.Add('Комплекс средств защиты хорошо сбалансирован.');
+    
+    if CalculateTotalCost > 150000 then
+      Report.Add('Внимание! Высокая стоимость комплекса. Рассмотрите возможность оптимизации.');
+    
+    // Сохраняем в Memo и файл
+    Memo1.Lines := Report;
+    ReportFile := ExtractFilePath(Application.ExeName) + 'Отчет_' + FormatDateTime('yyyy-mm-dd_hh-nn', Now) + '.txt';
+    Report.SaveToFile(ReportFile);
+
+    ShowMessage('Отчет успешно сформирован и сохранен в файл: ' + ReportFile);
+  finally
+    Report.Free;
+  end;
+end;
+
+procedure TForm1.ApplyFilters;
+var
+  FilterSQL: string;
+begin
+  FilterSQL := 'SELECT * FROM ProtectionMeasures WHERE 1=1';
+  
+  if TrackBar1.Position > 0 then
+    FilterSQL := FilterSQL + ' AND Уровень_защиты >= ' + IntToStr(TrackBar1.Position);
+  
+  if (ComboBox1.ItemIndex > 0) and (ComboBox1.Text <> 'Все категории') then
+    FilterSQL := FilterSQL + ' AND Категория = ''' + ComboBox1.Text + '''';
+
+  ADOQuery1.DisableControls;
+  try
+    ADOQuery1.Close;
+    ADOQuery1.SQL.Text := FilterSQL;
+    ADOQuery1.Open;
+  finally
+    ADOQuery1.EnableControls;
+  end;
+end;
+
+procedure TForm1.TrackBar1Change(Sender: TObject);
+begin
+  Label4.Caption := 'Текущий уровень: ' + NumberLevelToText(TrackBar1.Position);
+  ApplyFilters;
+end;
+
+function TForm1.GetProtectionByID(ID: Integer): TProtectionItem;
+var
+  i: Integer;
+begin
+  for i := 0 to High(FAllProtections) do
+    if FAllProtections[i].ID = ID then
+    begin
+      Result := FAllProtections[i];
+      Exit;
+    end;
+  raise Exception.Create('Средство защиты не найдено');
+end;
+
+function TForm1.CalculateCompatibilityScore: Integer;
+var
+  i, j: Integer;
+  Query: TADOQuery;
+  TotalScore, PairCount: Integer;
+begin
+  Result := 100; // Значение по умолчанию
+  
+  if FSelectedProtections.Count < 2 then
+    Exit;
+
+  Query := TADOQuery.Create(nil);
+  try
+    Query.Connection := ADOConnection1;
+    TotalScore := 0;
+    PairCount := 0;
+
+    for i := 0 to FSelectedProtections.Count - 2 do
+    begin
+      for j := i + 1 to FSelectedProtections.Count - 1 do
+      begin
+        Query.SQL.Text := Format(
+          'SELECT Compatibility FROM CompatibleProtections ' +
+          'WHERE (ProtectionID1 = %d AND ProtectionID2 = %d) ' +
+          '   OR (ProtectionID1 = %d AND ProtectionID2 = %d)',
+          [Integer(FSelectedProtections[i]), 
+           Integer(FSelectedProtections[j]),
+           Integer(FSelectedProtections[j]), 
+           Integer(FSelectedProtections[i])]);
+          
+        Query.Open;
+        
+        if not Query.Eof then
+        begin
+          Inc(TotalScore, Query.FieldByName('Compatibility').AsInteger);
+          Inc(PairCount);
+        end;
+        Query.Close;
+      end;
+    end;
+
+    if PairCount > 0 then
+      Result := Round(TotalScore / PairCount);
+      
+  finally
+    Query.Free;
+  end;
+end;
+
+
+function TForm1.CalculateTotalCost: Currency;
+var
+  i: Integer;
+begin
+  Result := 0;
+  for i := 0 to FSelectedProtections.Count - 1 do
+    Result := Result + GetProtectionByID(Integer(FSelectedProtections[i])).Cost;
+end;
+
+function TForm1.CalculateTotalEffectiveness: Integer;
+var
+  i, j: Integer;
+  Query: TADOQuery;
+begin
+  Result := 0;
+  if (FSelectedProtections.Count = 0) or (CheckListBox1.SelCount = 0) then
+    Exit;
+
+  Query := TADOQuery.Create(nil);
+  try
+    Query.Connection := ADOConnection1;
+
+    for i := 0 to CheckListBox1.Items.Count - 1 do
+    begin
+      if CheckListBox1.Checked[i] then
+      begin
+        for j := 0 to FSelectedProtections.Count - 1 do
+        begin
+          Query.SQL.Text :=
+  'SELECT Эффективность FROM Relations WHERE ' +
+  'ThreatID = (SELECT ID FROM Threats WHERE Название = ''' + 
+  Copy(CheckListBox1.Items[i], 1, Pos(' (', CheckListBox1.Items[i]) - 1) + ''') AND ' +
+  'ProtectionID = ' + IntToStr(Integer(FSelectedProtections[j]));
+          Query.Open;
+
+          if not Query.Eof then
+            Inc(Result, Query.FieldByName('Эффективность').AsInteger);
+
+          Query.Close;
+        end;
+      end;
+    end;
+    
+    Result := Round(Result / CheckListBox1.SelCount);
+  finally
+    Query.Free;
+  end;
+end;
+
+function TForm1.IsThreatCovered(ThreatIndex: Integer): Boolean;
+var
+  i: Integer;
+  Query: TADOQuery;
+begin
+  Result := False;
+  if not CheckListBox1.Checked[ThreatIndex] then Exit;
+
+  Query := TADOQuery.Create(nil);
+  try
+    Query.Connection := ADOConnection1;
+    
+    for i := 0 to FSelectedProtections.Count - 1 do
+    begin
+      Query.SQL.Text :=
+        'SELECT 1 FROM Relations WHERE ' +
+        'ThreatID = (SELECT ID FROM Threats WHERE Название = :ThreatName) AND ' +
+        'ProtectionID = :ProtID AND Эффективность > 0';
+
+      Query.Parameters.ParamByName('ThreatName').Value := 
+        Copy(CheckListBox1.Items[ThreatIndex], 1, Pos(' (', CheckListBox1.Items[ThreatIndex]) - 1);
+      Query.Parameters.ParamByName('ProtID').Value := Integer(FSelectedProtections[i]);
+      Query.Open;
+      
+      Result := not Query.Eof;
+      Query.Close;
+
+      if Result then Break;
+    end;
+  finally
+    Query.Free;
+  end;
+end;
+
+procedure TForm1.UpdateVisualIndicators;
+var
+  totalScore: Integer;
+begin
+  totalScore := CalculateTotalScore;
+  ProgressBar1.Position := totalScore;
+  LabelTotalScore.Caption := 'Общий балл: ' + IntToStr(totalScore);
+  
+  // Упрощенная индикация (без изменения цвета текста)
+  if totalScore < 40 then
+    ProgressBar1.Brush.Color := clRed
+  else if totalScore < 70 then
+    ProgressBar1.Brush.Color := clYellow
+  else
+    ProgressBar1.Brush.Color := clGreen;
+end;
+
+function TForm1.CalculateTotalScore: Integer;
+var costScore, effectScore, compatScore: Integer;
+  totalCost: Currency;
+begin
+  totalCost := CalculateTotalCost;
+  
+  // Адаптировано под 3-уровневую систему
+  if totalCost < 50000 then costScore := 40
+  else if totalCost < 100000 then costScore := 30
+  else if totalCost < 150000 then costScore := 20
+  else costScore := 10;
+
+  effectScore := Round(CalculateTotalEffectiveness * 0.5);
+  compatScore := Round(CalculateCompatibilityScore * 0.5);
+  
+  Result := costScore + effectScore + compatScore;
+end;
+
+
+// Добавляем обработчик для отображения текстовых значений в DBGrid
+procedure TForm1.DBGrid1DrawColumnCell(Sender: TObject; const Rect: TRect;
+  DataCol: Integer; Column: TColumn; State: TGridDrawState);
+var
+  Level: Integer;
+begin
+  // Для колонки с уровнем защиты
+  if Column.FieldName = 'Уровень_защиты' then
+  begin
+    DBGrid1.Canvas.FillRect(Rect);
+    
+    try
+      if not Column.Field.IsNull then
+      begin
+        Level := Column.Field.AsInteger;
+        DBGrid1.Canvas.TextOut(Rect.Left + 2, Rect.Top + 2, NumberLevelToText(Level));
+      end;
+    except
+      DBGrid1.Canvas.TextOut(Rect.Left + 2, Rect.Top + 2, 'Ошибка');
+    end;
+    Exit;
+  end;
+
+  // Для колонки с описанием (убираем (memo))
+  if Column.FieldName = 'Описание' then
+  begin
+    DBGrid1.Canvas.FillRect(Rect);
+    DBGrid1.Canvas.TextOut(Rect.Left + 2, Rect.Top + 2, 
+      StringReplace(Column.Field.AsString, '(memo)', '', [rfReplaceAll]));
+    Exit;
+  end;
+
+  // Стандартная отрисовка для других колонок
+  DBGrid1.DefaultDrawColumnCell(Rect, DataCol, Column, State);
+end;
+
+
+procedure TForm1.FileExitClick(Sender: TObject);
+begin
+   close
+end;
+
+procedure TForm1.HelpAboutClick(Sender: TObject);
+begin
+ShowMessage('Комплексная система подбора СЗИ' + #13#10 +
+              'Версия 1.0' + #13#10 +
+              '© 2025 ЯВВУ ПВО');
+end;
+
+procedure TForm1.HelpContentsClick(Sender: TObject);
+begin
+ ShowMessage('Инструкция по использованию:' + #13#10 +
+              '1. Выберите угрозы в левом списке' + #13#10 +
+              '2. Выделите средства защиты (Ctrl+Click для множественного выбора)' + #13#10 +
+              '3. Нажмите "Подобрать оптимальные средства"');
+end;
+
+procedure TForm1.ComboBox1Change(Sender: TObject);
+begin
+
+  ApplyFilters; // Используем единый метод фильтрации
+
+  end;
+
+
+
+procedure TForm1.btnRandomThreatsClick(Sender: TObject);
+var
+  i: Integer;
+begin
+  Randomize;
+  for i := 0 to CheckListBox1.Items.Count - 1 do
+    CheckListBox1.Checked[i] := (Random(100) > 50); // 50% вероятность выбора
+  UpdateVisualIndicators;
+end;
+
+procedure TForm1.btnClearThreatsClick(Sender: TObject);
+var
+  i: Integer;
+begin
+  for i := 0 to CheckListBox1.Items.Count - 1 do
+    CheckListBox1.Checked[i] := False;
+  UpdateVisualIndicators;
+end;
+
+end.
